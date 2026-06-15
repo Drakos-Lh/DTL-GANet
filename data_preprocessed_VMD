@@ -1,0 +1,694 @@
+import json
+from pathlib import Path
+from dataclasses import dataclass, asdict
+
+import numpy as np
+import pandas as pd
+from vmdpy import VMD
+from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "SimSun"]
+
+
+# =========================================================
+# 1. 配置
+# =========================================================
+@dataclass
+class Config:
+    data_path: str = "ningxia6.csv"
+    output_dir: str = "vmd_data"
+    figure_dir: str = "vmd_figures"
+
+    input_len: int = 96
+    horizon: int = 1
+    num_farms: int = 6
+
+    train_ratio: float = 0.7
+    val_ratio: float = 0.1
+    test_ratio: float = 0.2
+
+    # VMD 参数
+    K: int = 3
+    alpha: int = 2000
+    tau: int = 0
+    DC: int = 0
+    init: int = 1
+    tol: float = 1e-7
+
+    # 局部趋势图横轴范围
+    local_start: int = 0
+    local_len: int = 600
+
+
+CFG = Config()
+
+
+# =========================================================
+# 2. 基础工具
+# =========================================================
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def save_json(obj, path: Path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def split_raw_series(data: np.ndarray, train_ratio: float, val_ratio: float):
+    total_len = len(data)
+    train_end = int(total_len * train_ratio)
+    val_end = int(total_len * (train_ratio + val_ratio))
+
+    train_raw = data[:train_end]
+    val_raw = data[train_end:val_end]
+    test_raw = data[val_end:]
+
+    return train_raw, val_raw, test_raw, train_end, val_end
+
+
+def extend_with_context(prev_raw: np.ndarray, curr_raw: np.ndarray, input_len: int):
+    context = prev_raw[-input_len:]
+    return np.concatenate([context, curr_raw], axis=0)
+
+
+# =========================================================
+# 3. 绘图工具
+# =========================================================
+def get_farm_colors(num_farms: int):
+    """
+    为 6 个风电场固定颜色。
+    图1和图2共用该颜色表，保证同一风电场颜色一致。
+    """
+    base_colors = [
+        "#1f77b4",  # Farm 1 - 蓝
+        "#ff7f0e",  # Farm 2 - 橙
+        "#2ca02c",  # Farm 3 - 绿
+        "#d62728",  # Farm 4 - 红
+        "#9467bd",  # Farm 5 - 紫
+        "#8c564b",  # Farm 6 - 棕
+    ]
+    return base_colors[:num_farms]
+
+
+def plot_raw_power_series(raw_data: np.ndarray, cfg: Config, figure_dir: Path, farm_colors):
+    """
+    图1：原始功率时间序列图。
+    直接使用原始数据 raw_data 作图，不使用标准化数据。
+
+    输入:
+        raw_data: (T, N)
+    """
+    T, N = raw_data.shape
+    x = np.arange(T)
+
+    plt.figure(figsize=(14, 6))
+
+    for farm in range(N):
+        plt.plot(
+            x,
+            raw_data[:, farm],
+            linewidth=0.9,
+            color=farm_colors[farm],
+            label=f"Farm {farm + 1}"
+        )
+
+    plt.xlabel("时间步长")
+    plt.ylabel("功率")
+    plt.title("Original Wind Power Time Series of Six Wind Farms")
+    plt.legend(ncol=3, fontsize=9)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+
+    save_path = figure_dir / "fig2_1_original_power_series.png"
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+    print(f"原始功率时间序列图已保存: {save_path.resolve()}")
+
+
+def decompose_full_scaled_for_plot(data_scaled: np.ndarray, cfg: Config):
+    """
+    为绘图单独对完整标准化序列做一次 VMD 分解。
+    注意：该函数只用于第2章展示 VMD 分解效果，不参与模型训练数据保存。
+
+    输入:
+        data_scaled: (T, N)
+
+    输出:
+        modes_all:  (T, N, K)
+        omega_all:  (N, K)
+    """
+    T, N = data_scaled.shape
+
+    modes_list = []
+    omega_all = []
+
+    print("\n开始为绘图进行完整序列 VMD 分解...")
+
+    for farm in range(N):
+        print(f"绘图分解 Farm {farm + 1}/{N}")
+
+        signal = data_scaled[:, farm]
+
+        u, u_hat, omega = VMD(
+            signal,
+            alpha=cfg.alpha,
+            tau=cfg.tau,
+            K=cfg.K,
+            DC=cfg.DC,
+            init=cfg.init,
+            tol=cfg.tol
+        )
+
+        # u: (K, T) -> (T, K)
+        u = u.T
+
+        # 按最终中心频率从低到高排序
+        omega_final = omega[-1]
+        order = np.argsort(omega_final)
+        omega_sorted = omega_final[order]
+        u = u[:, order]
+
+        modes_list.append(u.astype(np.float32))
+        omega_all.append(omega_sorted.astype(np.float32))
+
+    modes_all = np.stack(modes_list, axis=1)  # (T, N, K)
+    omega_all = np.stack(omega_all, axis=0)  # (N, K)
+
+    return modes_all, omega_all
+
+
+def plot_vmd_components_grid(modes_all: np.ndarray, cfg: Config, figure_dir: Path, farm_colors):
+    """
+    图2：六个风电场 VMD 分解结果大图。
+    3行2列，每个子图对应一个风电场；
+    每个风电场内部从上到下依次排布低频、中频、高频分量。
+
+    输入:
+        modes_all: (T, N, K)
+    """
+    T, N, K = modes_all.shape
+    x = np.arange(T)
+
+    if K != 3:
+        raise ValueError(f"当前绘图函数默认 K=3，但实际 K={K}")
+
+    fig, axes = plt.subplots(3, 2, figsize=(16, 12), sharex=True)
+    axes = axes.flatten()
+
+    component_names = ["Low-frequency component", "Mid-frequency component", "High-frequency component"]
+
+    for farm in range(N):
+        ax = axes[farm]
+        color = farm_colors[farm]
+
+        # 为了让低/中/高在同一个子图中从上到下分开显示，增加垂直偏移量
+        low = modes_all[:, farm, 0]
+        mid = modes_all[:, farm, 1]
+        high = modes_all[:, farm, 2]
+
+        # 根据该风电场三个分量的幅值自动设置偏移距离
+        all_abs_max = max(
+            np.max(np.abs(low)),
+            np.max(np.abs(mid)),
+            np.max(np.abs(high)),
+            1e-6
+        )
+        offset = all_abs_max * 2.5
+
+        y_low = low + offset
+        y_mid = mid
+        y_high = high - offset
+
+        ax.plot(x, y_low, color=color, linewidth=0.8)
+        ax.plot(x, y_mid, color=color, linewidth=0.8)
+        ax.plot(x, y_high, color=color, linewidth=0.8)
+
+        # 标注低中高频位置
+        ax.text(0.01, 0.82, component_names[0], transform=ax.transAxes, fontsize=9)
+        ax.text(0.01, 0.50, component_names[1], transform=ax.transAxes, fontsize=9)
+        ax.text(0.01, 0.18, component_names[2], transform=ax.transAxes, fontsize=9)
+
+        ax.set_title(f"Farm {farm + 1}", fontsize=11)
+        ax.grid(alpha=0.25)
+
+        # 去掉 y 轴刻度，避免偏移后的数值干扰阅读
+        ax.set_yticks([])
+
+    # 如果子图数量多于风电场数量，隐藏多余子图
+    for idx in range(N, len(axes)):
+        axes[idx].axis("off")
+
+    fig.suptitle("VMD Decomposition Results of Six Wind Farms", fontsize=15)
+    fig.supxlabel("Time step")
+    fig.supylabel("VMD components: low / mid / high")
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    save_path = figure_dir / "fig2_2_vmd_components_grid.png"
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+    print(f"VMD 分解结果大图已保存: {save_path.resolve()}")
+
+def get_local_slice(total_len: int, cfg: Config):
+    """
+    根据 cfg.local_start 和 cfg.local_len 获取局部绘图区间。
+    """
+    start = max(0, int(cfg.local_start))
+    end = min(total_len, start + int(cfg.local_len))
+
+    if end <= start:
+        raise ValueError(
+            f"局部绘图范围无效: start={start}, end={end}, total_len={total_len}"
+        )
+
+    return start, end
+
+
+def plot_raw_power_series_local(raw_data: np.ndarray,
+                                cfg: Config,
+                                figure_dir: Path,
+                                farm_colors):
+    """
+    局部图1：原始功率时间序列局部放大图。
+    直接使用原始数据 raw_data 作图，不使用标准化数据。
+    仍然包含六个风电场，颜色与全局原始功率图保持一致。
+    """
+    T, N = raw_data.shape
+    start, end = get_local_slice(T, cfg)
+    x = np.arange(start, end)
+
+    plt.figure(figsize=(14, 6))
+
+    for farm in range(N):
+        plt.plot(
+            x,
+            raw_data[start:end, farm],
+            linewidth=1.2,
+            color=farm_colors[farm],
+            label=f"Farm {farm + 1}"
+        )
+
+    plt.xlabel("时间步长")
+    plt.ylabel("功率")
+    plt.title(
+        f"Local Original Wind Power Time Series "
+        f"(Time step {start}–{end - 1})"
+    )
+    plt.legend(ncol=3, fontsize=9)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+
+    save_path = figure_dir / "fig2_3_original_power_series_local.png"
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+    print(f"局部原始功率时间序列图已保存: {save_path.resolve()}")
+
+
+def plot_farm1_vmd_local_trend(data_scaled: np.ndarray,
+                               modes_all: np.ndarray,
+                               cfg: Config,
+                               figure_dir: Path):
+    """
+    局部图2：一号风电场 VMD 局部分解图。
+    从上到下依次为：
+        1）标准化后的原始功率信号
+        2）低频分量
+        3）中频分量
+        4）高频分量
+
+    使用不同深浅的蓝色表示 Farm 1 的不同分量。
+    """
+    T, N = data_scaled.shape
+    T_modes, N_modes, K = modes_all.shape
+
+    if T != T_modes:
+        raise ValueError(f"data_scaled 和 modes_all 长度不一致: {T} vs {T_modes}")
+    if K != 3:
+        raise ValueError(f"当前绘图函数默认 K=3，但实际 K={K}")
+
+    start, end = get_local_slice(T, cfg)
+    x = np.arange(start, end)
+
+    farm = 0  # 一号风电场
+
+    raw_scaled = data_scaled[start:end, farm]
+    low = modes_all[start:end, farm, 0]
+    mid = modes_all[start:end, farm, 1]
+    high = modes_all[start:end, farm, 2]
+
+    # 不同深浅的蓝色
+    colors = {
+        "raw": "#08306B",   # 深蓝
+        "low": "#2171B5",   # 较深蓝
+        "mid": "#4292C6",   # 中深蓝
+        "high": "#6BAED6",  # 中蓝
+    }
+
+    fig, axes = plt.subplots(4, 1, figsize=(14, 9), sharex=True)
+
+    axes[0].plot(x, raw_scaled, color=colors["raw"], linewidth=1.2)
+    axes[0].set_ylabel("Scaled\nPower")
+    axes[0].set_title("Original signal")
+
+    axes[1].plot(x, low, color=colors["low"], linewidth=1.2)
+    axes[1].set_ylabel("Low")
+    axes[1].set_title("Low-frequency component")
+
+    axes[2].plot(x, mid, color=colors["mid"], linewidth=1.2)
+    axes[2].set_ylabel("Mid")
+    axes[2].set_title("Mid-frequency component")
+
+    axes[3].plot(x, high, color=colors["high"], linewidth=1.2)
+    axes[3].set_ylabel("High")
+    axes[3].set_title("High-frequency component")
+    axes[3].set_xlabel("Time step")
+
+    for ax in axes:
+        ax.grid(alpha=0.3)
+
+    fig.suptitle(
+        f"Local VMD Decomposition of Farm 1 "
+        f"(Time step {start}–{end - 1})",
+        fontsize=14
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+    save_path = figure_dir / "fig2_4_farm1_vmd_local_decomposition.png"
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+    print(f"一号风电场 VMD 局部分解图已保存: {save_path.resolve()}")
+# =========================================================
+# 3. VMD 分解
+# =========================================================
+def decompose_segment_with_vmd(data_scaled: np.ndarray, cfg: Config):
+    """
+    输入:
+        data_scaled: (T, N)
+
+    输出:
+        lowmid_all: (T, N, K-1)
+        high_all:   (T, N, 1)
+        omega_all:  (N, K)
+    """
+    T, N = data_scaled.shape
+
+    lowmid_list = []
+    high_list = []
+    omega_all = []
+
+    print(f"\n开始 VMD 分解，序列长度 = {T}")
+
+    for farm in range(N):
+        print(f"风电场 {farm + 1}/{N}")
+
+        signal = data_scaled[:, farm]
+
+        u, u_hat, omega = VMD(
+            signal,
+            alpha=cfg.alpha,
+            tau=cfg.tau,
+            K=cfg.K,
+            DC=cfg.DC,
+            init=cfg.init,
+            tol=cfg.tol
+        )
+
+        # u: (K, T) -> (T, K)
+        u = u.T
+
+        omega_final = omega[-1]
+        order = np.argsort(omega_final)
+        omega_sorted = omega_final[order]
+
+        print("排序后中心频率:", omega_sorted)
+
+        u = u[:, order]
+
+        # 低中频 = 除最高频之外
+        lowmid = u[:, :-1]   # (T, K-1)
+        high = u[:, -1:]     # (T, 1)
+
+        lowmid_list.append(lowmid)
+        high_list.append(high)
+        omega_all.append(omega_sorted)
+
+    lowmid_all = np.stack(lowmid_list, axis=1).astype(np.float32)  # (T, N, K-1)
+    high_all = np.stack(high_list, axis=1).astype(np.float32)      # (T, N, 1)
+    omega_all = np.stack(omega_all, axis=0).astype(np.float32)     # (N, K)
+
+    return lowmid_all, high_all, omega_all
+
+
+# =========================================================
+# 4. 构造滑窗
+# =========================================================
+def make_windows(lowmid_all: np.ndarray,
+                 high_all: np.ndarray,
+                 full_target_scaled: np.ndarray,
+                 input_len: int,
+                 horizon: int):
+    """
+    输入:
+        lowmid_all:         (T1, N, K-1)
+        high_all:           (T2, N, 1)
+        full_target_scaled: (T3, N)
+
+    输出:
+        X_lowmid:   (samples, input_len, N, K-1)
+        X_high:     (samples, input_len, N, 1)
+        y_full:     (samples, horizon, N)
+        y_lowmid:   (samples, horizon, N)
+        y_high:     (samples, horizon, N)
+    """
+
+    # 先统一长度，避免某个 split 里 VMD 输出长度和目标长度不完全一致
+    T = min(lowmid_all.shape[0], high_all.shape[0], full_target_scaled.shape[0])
+
+    lowmid_all = lowmid_all[:T]
+    high_all = high_all[:T]
+    full_target_scaled = full_target_scaled[:T]
+
+    # 低中频总和目标 / 高频目标
+    lowmid_sum = lowmid_all.sum(axis=-1)   # (T, N)
+    high_only = high_all[..., 0]           # (T, N)
+
+    num_samples = T - input_len - horizon + 1
+    if num_samples <= 0:
+        raise ValueError(
+            f"样本数<=0，请检查长度。"
+            f"T={T}, input_len={input_len}, horizon={horizon}"
+        )
+
+    N = full_target_scaled.shape[1]
+    lowmid_feat_dim = lowmid_all.shape[2]
+
+    # 预分配，保证每个样本 shape 完全一致
+    X_lowmid = np.zeros((num_samples, input_len, N, lowmid_feat_dim), dtype=np.float32)
+    X_high = np.zeros((num_samples, input_len, N, 1), dtype=np.float32)
+    y_full = np.zeros((num_samples, horizon, N), dtype=np.float32)
+    y_lowmid = np.zeros((num_samples, horizon, N), dtype=np.float32)
+    y_high = np.zeros((num_samples, horizon, N), dtype=np.float32)
+
+    for i in tqdm(range(num_samples), desc="构造滑窗"):
+        X_lowmid[i] = lowmid_all[i:i + input_len]
+        X_high[i] = high_all[i:i + input_len]
+        y_full[i] = full_target_scaled[i + input_len:i + input_len + horizon]
+        y_lowmid[i] = lowmid_sum[i + input_len:i + input_len + horizon]
+        y_high[i] = high_only[i + input_len:i + input_len + horizon]
+
+    return X_lowmid, X_high, y_full, y_lowmid, y_high
+
+
+# =========================================================
+# 5. 处理单个 split
+# =========================================================
+def process_split(split_name: str,
+                  raw_segment: np.ndarray,
+                  scaler: StandardScaler,
+                  cfg: Config):
+    print(f"\n========== 处理 {split_name} ==========")
+
+    segment_scaled = scaler.transform(raw_segment).astype(np.float32)
+    print(f"{split_name} scaled shape:", segment_scaled.shape)
+
+    lowmid_all, high_all, omega_all = decompose_segment_with_vmd(segment_scaled, cfg)
+
+    print(f"{split_name} lowmid_all:", lowmid_all.shape)
+    print(f"{split_name} high_all  :", high_all.shape)
+
+    X_lowmid, X_high, y_full, y_lowmid, y_high = make_windows(
+        lowmid_all=lowmid_all,
+        high_all=high_all,
+        full_target_scaled=segment_scaled,
+        input_len=cfg.input_len,
+        horizon=cfg.horizon
+    )
+
+    print(f"{split_name} X_lowmid :", X_lowmid.shape)
+    print(f"{split_name} X_high   :", X_high.shape)
+    print(f"{split_name} y_full   :", y_full.shape)
+    print(f"{split_name} y_lowmid :", y_lowmid.shape)
+    print(f"{split_name} y_high   :", y_high.shape)
+
+    return {
+        "X_lowmid": X_lowmid,
+        "X_high": X_high,
+        "y_full": y_full,
+        "y_lowmid": y_lowmid,
+        "y_high": y_high,
+        "omega_sorted": omega_all
+    }
+
+
+# =========================================================
+# 6. 主流程
+# =========================================================
+def main():
+    output_dir = Path(CFG.output_dir)
+    ensure_dir(output_dir)
+
+    print("读取数据...")
+    data = pd.read_csv(CFG.data_path).values.astype(np.float32)
+    assert data.shape[1] == CFG.num_farms, f"列数应为 {CFG.num_farms}，实际是 {data.shape[1]}"
+    print("原始数据形状:", data.shape)
+
+    # ---------- 绘图目录 ----------
+    figure_dir = Path(CFG.figure_dir)
+    ensure_dir(figure_dir)
+
+    # ---------- 固定颜色 ----------
+    farm_colors = get_farm_colors(CFG.num_farms)
+
+    # ---------- 图1：原始功率时间序列 ----------
+    plot_raw_power_series(
+        raw_data=data,
+        cfg=CFG,
+        figure_dir=figure_dir,
+        farm_colors=farm_colors
+    )
+
+    # ---------- 局部图1：原始功率时间序列局部放大 ----------
+    plot_raw_power_series_local(
+        raw_data=data,
+        cfg=CFG,
+        figure_dir=figure_dir,
+        farm_colors=farm_colors
+    )
+
+    # ---------- 时间顺序切分 ----------
+    train_raw, val_raw, test_raw, train_end, val_end = split_raw_series(
+        data,
+        CFG.train_ratio,
+        CFG.val_ratio
+    )
+
+    print("\n===== 原始数据划分 =====")
+    print("train_raw:", train_raw.shape)
+    print("val_raw  :", val_raw.shape)
+    print("test_raw :", test_raw.shape)
+
+    # ---------- 给 val / test 补上下文 ----------
+    val_raw_with_context = extend_with_context(train_raw, val_raw, CFG.input_len)
+    test_raw_with_context = extend_with_context(
+        np.concatenate([train_raw, val_raw], axis=0),
+        test_raw,
+        CFG.input_len
+    )
+
+    print("\n===== 带上下文的划分 =====")
+    print("train_raw         :", train_raw.shape)
+    print("val_raw_with_ctx  :", val_raw_with_context.shape)
+    print("test_raw_with_ctx :", test_raw_with_context.shape)
+
+    # ---------- 只用训练集拟合 scaler ----------
+    scaler = StandardScaler()
+    scaler.fit(train_raw)
+
+    np.save(output_dir / "scaler_mean.npy", scaler.mean_.astype(np.float32))
+    np.save(output_dir / "scaler_scale.npy", scaler.scale_.astype(np.float32))
+
+    # ---------- 图2：基于标准化完整序列的 VMD 分解展示图 ----------
+    # 说明：这里仅用于第2章画图展示，不参与 train/val/test 的模型训练数据保存。
+    data_scaled_for_plot = scaler.transform(data).astype(np.float32)
+
+    modes_all_for_plot, omega_all_for_plot = decompose_full_scaled_for_plot(
+        data_scaled=data_scaled_for_plot,
+        cfg=CFG
+    )
+
+    np.save(figure_dir / "plot_omega_sorted_full.npy", omega_all_for_plot)
+
+    plot_vmd_components_grid(
+        modes_all=modes_all_for_plot,
+        cfg=CFG,
+        figure_dir=figure_dir,
+        farm_colors=farm_colors
+    )
+
+    # ---------- 局部图2：一号风电场 VMD 局部分解 ----------
+    plot_farm1_vmd_local_trend(
+        data_scaled=data_scaled_for_plot,
+        modes_all=modes_all_for_plot,
+        cfg=CFG,
+        figure_dir=figure_dir
+    )
+
+    # ---------- 分别处理 train / val / test ----------
+    train_pack = process_split("train", train_raw, scaler, CFG)
+    val_pack = process_split("val", val_raw_with_context, scaler, CFG)
+    test_pack = process_split("test", test_raw_with_context, scaler, CFG)
+
+    # ---------- 保存 train ----------
+    np.save(output_dir / "train_X_lowmid.npy", train_pack["X_lowmid"])
+    np.save(output_dir / "train_X_high.npy", train_pack["X_high"])
+    np.save(output_dir / "train_y_full.npy", train_pack["y_full"])
+    np.save(output_dir / "train_y_lowmid.npy", train_pack["y_lowmid"])
+    np.save(output_dir / "train_y_high.npy", train_pack["y_high"])
+    np.save(output_dir / "train_omega_sorted.npy", train_pack["omega_sorted"])
+
+    # ---------- 保存 val ----------
+    np.save(output_dir / "val_X_lowmid.npy", val_pack["X_lowmid"])
+    np.save(output_dir / "val_X_high.npy", val_pack["X_high"])
+    np.save(output_dir / "val_y_full.npy", val_pack["y_full"])
+    np.save(output_dir / "val_y_lowmid.npy", val_pack["y_lowmid"])
+    np.save(output_dir / "val_y_high.npy", val_pack["y_high"])
+    np.save(output_dir / "val_omega_sorted.npy", val_pack["omega_sorted"])
+
+    # ---------- 保存 test ----------
+    np.save(output_dir / "test_X_lowmid.npy", test_pack["X_lowmid"])
+    np.save(output_dir / "test_X_high.npy", test_pack["X_high"])
+    np.save(output_dir / "test_y_full.npy", test_pack["y_full"])
+    np.save(output_dir / "test_y_lowmid.npy", test_pack["y_lowmid"])
+    np.save(output_dir / "test_y_high.npy", test_pack["y_high"])
+    np.save(output_dir / "test_omega_sorted.npy", test_pack["omega_sorted"])
+
+    meta = {
+        **asdict(CFG),
+        "raw_total_len": int(len(data)),
+        "train_raw_len": int(len(train_raw)),
+        "val_raw_len": int(len(val_raw)),
+        "test_raw_len": int(len(test_raw)),
+        "train_end_index": int(train_end),
+        "val_end_index": int(val_end),
+        "train_windows": int(len(train_pack["X_lowmid"])),
+        "val_windows": int(len(val_pack["X_lowmid"])),
+        "test_windows": int(len(test_pack["X_lowmid"]))
+    }
+    save_json(meta, output_dir / "meta.json")
+
+    print("\n===== 数据保存完成 =====")
+    print(f"保存目录: {output_dir.resolve()}")
+    print("新增关键文件:")
+    print("  train_y_full.npy / train_y_lowmid.npy / train_y_high.npy")
+    print("  val_y_full.npy   / val_y_lowmid.npy   / val_y_high.npy")
+    print("  test_y_full.npy  / test_y_lowmid.npy  / test_y_high.npy")
+
+
+if __name__ == "__main__":
+    main()
